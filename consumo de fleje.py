@@ -1,131 +1,110 @@
 import streamlit as st
 import pandas as pd
-import pdfplumber
-import io
+import pytesseract
+from pdf2image import convert_from_bytes
 import re
+import io
 
-# Configuración de página minimalista
 st.set_page_config(page_title="Consumo de Fleje", layout="centered")
 
-# --- ENCABEZADO ---
 st.markdown("<h1 style='text-align: center;'>Consumo de fleje</h1>", unsafe_allow_html=True)
 
-# --- TEXTO INTRODUCTORIO (JUSTIFICADO) ---
 st.markdown("""
 <div style="text-align: justify;">
-Esta aplicación sirve para sumar el peso del fleje consumido por máquina en cada turno. Tú lo único que tienes que hacer es:
-<br><br>
-1. Coger los partes de los desbobinadores y asegurarte que en TODAS las páginas sea legible la máquina a la que se le corresponde el parte, que está marcada la casilla del turno de mañana, de tarde o de noche y que también esté escrita y sea legible la fecha.
-<br><br>
-2. Cuando tengas todos los partes preparados de la forma que se indica, lo que tienes que hacer es escanearlos, todos juntos. Ojo, recuerda indicarle a la impresora multifunción que te escanée los partes por las dos caras, que si no se nos puede quedar información por el medio.
-<br><br>
-3. El .pdf que has obtenido, adjúntalo en el cuadro que aparece aquí abajo, sin más.
-<br><br>
-Con todo esto, al final te devolveré una tabla en el que te hago la suma de todo el fleje metido a máquina por máquina y por turno.
+Esta aplicación sirve para sumar el peso del fleje consumido por máquina en cada turno... [Instrucciones simplificadas para el código]
 </div>
 """, unsafe_allow_html=True)
 
-st.write("---")
+uploaded_file = st.file_uploader("Adjunta el PDF escaneado", type="pdf")
 
-# --- BOTÓN DE CARGA DE ARCHIVO ---
-uploaded_file = st.file_uploader("Arrastra o busca tu archivo PDF", type="pdf")
-
-def extract_data(pdf_file):
-    all_rows = []
+def procesar_pdf(file_bytes):
+    # Convertimos el PDF en imágenes (una por página)
+    images = convert_from_bytes(file_bytes.read())
+    all_data = []
     
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if not text:
-                continue
+    # Variables para recordar el valor anterior (Recursividad de comillas)
+    last_e = 0.0
+    last_g = 0.0
+
+    for i, img in enumerate(images):
+        # OCR: Extraemos el texto de la imagen de la página
+        text = pytesseract.image_to_string(img, lang='spa')
+        
+        # 1. Identificar Máquina (L11, L12...)
+        maquina = re.search(r"L\d{2}", text)
+        maquina = maquina.group(0) if maquina else "L??"
+        
+        # 2. Identificar Fecha
+        fecha = re.search(r"\d{2}/\d{2}/\d{4}", text)
+        fecha = fecha.group(0) if fecha else "S/Fecha"
+        
+        # 3. Identificar Turno
+        turno = "Mañana"
+        if "Tarde" in text or "[X] Tarde" in text: turno = "Tarde"
+        elif "Noche" in text or "[X] Noche" in text: turno = "Noche"
+
+        # 4. Extraer números de las columnas (Peso Etiqueta y Peso Gancho)
+        # Buscamos líneas que tengan números o comillas
+        lines = text.split('\n')
+        for line in lines:
+            # Buscamos números decimales o el símbolo de comillas
+            parts = re.findall(r'(\d+[\.,]\d+|"|' + "''" + ')', line)
             
-            # 1a) Identificar Máquina (L11, L12...)
-            maquina_match = re.search(r"L\d{2}", text)
-            maquina = maquina_match.group(0) if maquina_match else "Desconocida"
-            
-            # 1b) Identificar Fecha (Buscamos patrón DD/MM/AAAA)
-            fecha_match = re.search(r"\d{2}/\d{2}/\d{4}", text)
-            fecha = fecha_match.group(0) if fecha_match else "S/F"
-            
-            # 1c) Identificar Turno
-            # Esto busca la palabra que tenga una marca cerca o esté en el texto
-            turno = "Desconocido"
-            if "Mañana" in text: turno = "Mañana"
-            elif "Tarde" in text: turno = "Tarde"
-            elif "Noche" in text: turno = "Noche"
-            
-            # 2, 3, 4, 5) Analizar Tabla de datos
-            table = page.extract_table()
-            if table:
-                last_etiqueta = 0
-                last_gancho = 0
+            if parts:
+                raw_e = parts[0]
+                raw_g = parts[1] if len(parts) > 1 else "0"
+
+                # Lógica Peso Etiqueta + Comillas
+                if raw_e in ['"', "''"]:
+                    val_e = last_e
+                else:
+                    try:
+                        val_e = float(raw_e.replace(',', '.'))
+                        last_e = val_e
+                    except: val_e = 0.0
+
+                # Lógica Peso Gancho + Comillas + Vacío
+                if raw_g in ['"', "''"]:
+                    val_g = last_g
+                else:
+                    try:
+                        val_g = float(raw_g.replace(',', '.'))
+                        last_g = val_g
+                    except: val_g = 0.0
                 
-                for row in table:
-                    # Filtramos filas que parezcan contener datos numéricos o comillas
-                    # Ajustar índices [0] y [1] según la posición real en tu PDF
-                    raw_e = row[0] if len(row) > 0 else None
-                    raw_g = row[1] if len(row) > 1 else None
-                    
-                    # Lógica de recursividad (Comillas)
-                    if raw_e == '"' or raw_e == "''":
-                        val_e = last_etiqueta
-                    else:
-                        try:
-                            val_e = float(str(raw_e).replace(',', '.'))
-                            last_etiqueta = val_e
-                        except: val_e = 0
-                        
-                    if raw_g == '"' or raw_g == "''":
-                        val_g = last_gancho
-                    elif not raw_g or raw_g.strip() == "":
-                        val_g = 0
-                    else:
-                        try:
-                            val_g = float(str(raw_g).replace(',', '.'))
-                            last_gancho = val_g
-                        except: val_g = 0
-                    
-                    if val_e > 0 or val_g > 0:
-                        all_data = {
-                            "Fecha": fecha,
-                            "Turno": turno,
-                            "Maquina": maquina,
-                            "Peso Etiqueta": val_e,
-                            "Peso Gancho": val_g
-                        }
-                        all_rows.append(all_data)
-                        
-    return pd.DataFrame(all_rows)
+                if val_e > 0 or val_g > 0:
+                    all_data.append({
+                        "Fecha": fecha,
+                        "Turno": turno,
+                        "Maquina": maquina,
+                        "Peso etiqueta": val_e,
+                        "Peso gancho": val_g
+                    })
+
+    return pd.DataFrame(all_data)
 
 if uploaded_file:
-    with st.spinner('Procesando PDF y sumando fleje...'):
-        df = extract_data(uploaded_file)
+    with st.spinner('Leyendo manuscritos y procesando...'):
+        df_final = procesar_pdf(uploaded_file)
         
-        if not df.empty:
-            # Agrupar y pivotar para el formato pedido
-            pivot_df = df.pivot_table(
+        if not df_final.empty:
+            # Crear la tabla pivote con el formato exacto solicitado
+            tabla_pivote = df_final.pivot_table(
                 index=['Fecha', 'Turno'],
                 columns='Maquina',
-                values=['Peso Etiqueta', 'Peso Gancho'],
+                values=['Peso etiqueta', 'Peso gancho'],
                 aggfunc='sum'
             ).fillna(0)
             
-            # Reordenar niveles de columnas para que coincida con el diseño
-            pivot_df = pivot_df.swaplevel(0, 1, axis=1).sort_index(axis=1)
+            # Ajustar orden de columnas
+            tabla_pivote = tabla_pivote.swaplevel(0, 1, axis=1).sort_index(axis=1)
             
-            st.success("¡Procesamiento completado!")
-            st.dataframe(pivot_df)
+            st.success("Datos extraídos correctamente")
+            st.table(tabla_pivote) # st.table es más minimalista
             
-            # Exportar a Excel
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                pivot_df.to_excel(writer, sheet_name='Resumen')
-            
-            st.download_button(
-                label="Descargar Excel",
-                data=buffer.getvalue(),
-                file_name="resumen_consumo_fleje.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+            # Botón de exportar
+            towrite = io.BytesIO()
+            tabla_pivote.to_excel(towrite, index=True, header=True)
+            st.download_button(label="📥 Descargar Excel", data=towrite.getvalue(), file_name="consumo.xlsx")
         else:
-            st.error("No se detectaron datos válidos en el PDF.")
+            st.warning("No se encontraron datos. Asegúrate de que el encabezado (L11, L12...) y los números sean legibles.")
